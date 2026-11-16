@@ -80,7 +80,7 @@ services:
     exclude_from_hc: true
     entrypoint: ["/usr/local/bin/create-sites.sh"]
     environment:
-      SITES: ${SITES:?Set comma-separated site hostnames in Coolify}
+      SITES: ${SITES}
       INSTALL_APPS: ${INSTALL_APPS:-erpnext,hrms,crm}
       ADMIN_PASSWORD_FILE: /run/secrets/admin_password
       DB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
