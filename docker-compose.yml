@@ -1,0 +1,250 @@
+name: ${COMPOSE_PROJECT_NAME:-frappe-v16}
+
+x-frappe-image: &frappe-image
+  image: ${CUSTOM_IMAGE:-frappe-custom}:${CUSTOM_TAG:-v16}
+  pull_policy: missing
+  restart: unless-stopped
+
+services:
+  # Build the custom application image once. All Frappe services use this image.
+  backend:
+    <<: *frappe-image
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FRAPPE_BRANCH: ${FRAPPE_BRANCH:-version-16}
+        FRAPPE_PATH: ${FRAPPE_PATH:-https://github.com/frappe/frappe}
+        CACHE_BUST: ${CACHE_BUST:-}
+      secrets:
+        - apps_json
+    command: ["start.sh"]
+    environment:
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; s=socket.create_connection(('127.0.0.1',8000),5); s.close()"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+  configurator:
+    <<: *frappe-image
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        set -e;
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host "$$DB_HOST";
+        bench set-config -gp db_port "$$DB_PORT";
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+        bench set-config -gp socketio_port "$$SOCKETIO_PORT";
+        bench set-config -g chromium_path /usr/lib/chromium/chromium-headless-shell;
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    restart: on-failure
+
+  # Idempotent provisioning: creates each hostname in SITES if missing,
+  # and installs any apps listed in INSTALL_APPS that are not installed yet.
+  site-setup:
+    <<: *frappe-image
+    # This is an intentional one-shot provisioning task, not a long-running service.
+    exclude_from_hc: true
+    entrypoint: ["/usr/local/bin/create-sites.sh"]
+    environment:
+      SITES: ${SITES:?Set comma-separated site hostnames in Coolify}
+      INSTALL_APPS: ${INSTALL_APPS:-erpnext,hrms,crm}
+      ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      DB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+    secrets:
+      - admin_password
+      - db_root_password
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    restart: "no"
+
+  frontend:
+    <<: *frappe-image
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      NGINX_LISTEN_PORT: "8080"
+      FRAPPE_SITE_NAME_HEADER: "$$host"
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+    expose:
+      - "8080"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      backend:
+        condition: service_healthy
+      websocket:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; s=socket.create_connection(('127.0.0.1',8080),5); s.close()"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  websocket:
+    <<: *frappe-image
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const s=require('net').connect(9000,'127.0.0.1');s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  queue-short:
+    <<: *frappe-image
+    command: ["bench", "worker", "--queue", "short,default"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  queue-long:
+    <<: *frappe-image
+    command: ["bench", "worker", "--queue", "long,default,short"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *frappe-image
+    command: ["bench", "schedule"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  db:
+    image: mariadb:11.8
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --innodb-snapshot-isolation=OFF
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_AUTO_UPGRADE: "1"
+    secrets:
+      - db_root_password
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 20s
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis-cache:
+    image: redis:8.6-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  redis-queue:
+    image: redis:8.6-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-queue-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+secrets:
+  # Build-time secret: public app repository manifest. Do not put credentials here.
+  apps_json:
+    file: ./apps.json
+  # Runtime secrets are supplied as Coolify environment variables and mounted
+  # as files only into the services that need them.
+  db_root_password:
+    environment: DB_ROOT_PASSWORD
+  admin_password:
+    environment: ADMIN_PASSWORD
+
+volumes:
+  db-data:
+    name: ${VOLUME_PREFIX:-frappe-prod}_db-data
+  redis-queue-data:
+    name: ${VOLUME_PREFIX:-frappe-prod}_redis-queue-data
+  sites:
+    name: ${VOLUME_PREFIX:-frappe-prod}_sites
+  logs:
+    name: ${VOLUME_PREFIX:-frappe-prod}_logs

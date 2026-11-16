@@ -1,0 +1,14 @@
+.git
+.github
+.env
+.env.*
+*.log
+__pycache__
+*.pyc
+node_modules
+sites
+logs
+*.sql
+*.sql.gz
+*.tar
+*.tar.gz
