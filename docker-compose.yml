@@ -77,7 +77,6 @@ services:
   site-setup:
     <<: *frappe-image
     # This is an intentional one-shot provisioning task, not a long-running service.
-    exclude_from_hc: true
     entrypoint: ["/usr/local/bin/create-sites.sh"]
     environment:
       SITES: ${SITES}
